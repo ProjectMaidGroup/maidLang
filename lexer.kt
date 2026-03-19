@@ -1,3 +1,5 @@
+import org.intellij.lang.annotations.Identifier
+
 val operators = setOf(
     '!',
     '@',
@@ -24,133 +26,250 @@ val operators = setOf(
     '?',
     '|'
 )
+val enableToLinkWithEqual = setOf("+", "-", "*", "/", "|", "%", "&", "^", "=")
+val enableToDouble = setOf("+", "-", "&", "|")
+val whiteSpace = setOf('\\', '"', '\'', ' ', '\n', '\t')
+val escapeCharMap = mapOf('n' to '\n', 't' to '\t', '\'' to '\'')
 
-data class Token(val type: Int, val value: String) //define same as state
+data class Token(val type: LexState, val value: String) //define same as state
+enum class LexState(val id: Int) {
+    IDLE(0), IDENTIFIER(1), INTEGER(2), FLOAT(3), CHAR(4), STRING(5), OPERATOR(6), ANNOTATION(7)
+}
 
-suspend fun lexer(rawText: String) {
-    var state: Int = 0  // 0 -> Null Statement 1-> Identify 2->Int 3->Float 4:Char 5:String 6:Operator
+suspend fun lexer(rawText: String): MutableList<Token> {
+    var state = LexState.IDLE  // 0 -> Null Statement 1-> Identify 2->Int 3->Float 4:Char 5:String 6:Operator
     var catchSlash: Boolean = false //  捕捉到了反斜杠时为 true
     var lexerBuffer: String = ""
-    var tokenList = mutableListOf<Token>()
+    val tokenList = mutableListOf<Token>()
     for (character: Char in rawText) {
 
         when (state) {
-            0 -> {
+            LexState.IDLE -> {
                 when {
                     character.isDigit() -> {
                         lexerBuffer += character
-                        state = 2 //switch to Int mode
+                        state = LexState.INTEGER //switch to Int mode
                     }
 
                     character == '.' -> {
                         lexerBuffer = "."
-                        state = 6 //switch to Float mode
+                        state = LexState.FLOAT //switch to Float mode
                     }
 
-                    character == '\'' -> state = 4 //switch to Char mode
+                    character == '\'' -> state = LexState.CHAR //switch to Char mode
 
-                    character == '"' -> state = 5 //switch to String mode
+                    character == '"' -> state = LexState.STRING //switch to String mode
+                    operators.contains(character) -> {
+                        state = LexState.OPERATOR
+                        lexerBuffer += character
+                    }
 
-                    setOf(' ', '\n', '\t').contains(character) -> continue
-                    else -> state = 1 //switch to Identify mode
+                    whiteSpace.contains(character) -> continue
+                    else -> {
+                        state = LexState.IDENTIFIER
+                        lexerBuffer += character
+                    }//switch to Identify mode
                 }
             }
 
-            1 -> {
-                if (operators.contains(character) || setOf('\\', '"', '\'', ' ', '\n', '\t').contains(character)) {
-                    tokenList.add(Token(1, lexerBuffer))
+            LexState.IDENTIFIER -> {
+                if (character == '\'' || character == '"') {
+                    tokenList.add(Token(LexState.IDENTIFIER, lexerBuffer))
+                    lexerBuffer = ""
+                    state = when (character) {
+                        '\'' -> LexState.CHAR
+                        '"' -> LexState.STRING
+                        else -> LexState.IDLE
+                    }
+                    continue
+                }
+                if (operators.contains(character) || whiteSpace.contains(character)) {
+                    tokenList.add(Token(LexState.IDENTIFIER, lexerBuffer))
                     lexerBuffer = ""
                     if (operators.contains(character)) {
                         lexerBuffer += character
-                        state = 6
+                        state = LexState.OPERATOR
                         continue
                     }
-                    state = 0
+                    state = LexState.IDLE
                 } else lexerBuffer += character
             }
 
-            2 -> {
+            LexState.INTEGER -> {
                 if (character == '.' || character == 'e') {
                     lexerBuffer += character
-                    state = 3
+                    state = LexState.FLOAT
                     continue
                 }
-                if (operators.contains(character) || setOf('\\', '"', '\'', ' ', '\n', '\t').contains(character)) {
-                    tokenList.add(Token(1, lexerBuffer))
+                if (operators.contains(character) || whiteSpace.contains(character)) {
+                    tokenList.add(Token(LexState.INTEGER, lexerBuffer))
                     lexerBuffer = ""
                     if (operators.contains(character)) {
                         lexerBuffer += character
-                        state = 6
+                        state = LexState.OPERATOR
                         continue
                     }
-                    state = 0
+                    state = LexState.IDLE
+                    continue
+                }
+                if (character.isDigit()) lexerBuffer += character
+                else throw IllegalStateException("string $lexerBuffer is a illegal value")
+            }
+
+            LexState.FLOAT -> {
+                if (operators.contains(character) || whiteSpace.contains(character)) {
+                    tokenList.add(Token(LexState.FLOAT, lexerBuffer))
+                    lexerBuffer = ""
+                    if (operators.contains(character)) {
+                        lexerBuffer += character
+                        state = LexState.OPERATOR
+                        continue
+                    }
+                    state = LexState.IDLE
                     continue
                 }
                 if (character.isDigit()) lexerBuffer += character
                 else throw IllegalStateException("string $lexerBuffer is not a illegal value")
             }
 
-            3 -> {
-                if (operators.contains(character) || setOf('\\', '"', '\'', ' ', '\n', '\t').contains(character)) {
-                    tokenList.add(Token(1, lexerBuffer))
-                    lexerBuffer = ""
-                    if (operators.contains(character)) {
-                        lexerBuffer += character
-                        state = 6
-                        continue
-                    }
-                    state = 0
-                    continue
-                }
-                if (character.isDigit()) lexerBuffer += character
-                else throw IllegalStateException("string $lexerBuffer is not a illegal value")
-            }
-
-            4 -> {
+            LexState.CHAR -> {
                 if (character == '\\' && !catchSlash) {
                     catchSlash = true
                     continue
                 }
                 val currentCharacter: Char = when (catchSlash) {
                     true -> run {
-                        val mappedChar = mapOf('n' to '\n', 't' to '\t', '\'' to '\'')[character]
+                        val mappedChar = escapeCharMap[character]
                         if (mappedChar != null) return@run mappedChar
                         return@run character
                     }
 
                     false -> character
                 }
-                catchSlash = false
+
+
                 if (character == '\'') {
-                    tokenList.add(Token(4, lexerBuffer))
+                    if (catchSlash) {
+                        lexerBuffer += '\''
+                        continue
+                    }
+                    if (lexerBuffer.length != 1) {
+                        throw IllegalStateException("Type Char must have only one Character \u270B\uD83D\uDE2D\uD83E\uDD1A")
+                    }
+                    catchSlash = false
+                    tokenList.add(Token(LexState.CHAR, lexerBuffer))
                     lexerBuffer = ""
+                    state = LexState.IDLE
                     continue
                 }
-                if (lexerBuffer != "") {
+                catchSlash = false;
+                if (lexerBuffer.isNotEmpty()) {
                     throw IllegalStateException("Type Char must have only one Character \u270B\uD83D\uDE2D\uD83E\uDD1A")
                 } else {
                     lexerBuffer += currentCharacter
                 }
             }
 
-            5 -> {
+            LexState.STRING -> {
                 if (character == '\\' && !catchSlash) {
                     catchSlash = true
                     continue
                 }
                 if (catchSlash) {
-                    val currentChar = mapOf('n' to '\n', 't' to '\t', '\'' to '\'')[character];
+                    val currentChar = escapeCharMap[character];
                     if (currentChar != null) lexerBuffer += currentChar
                     else lexerBuffer += character
+                    catchSlash = false
                     continue
                 }
                 if (character == '"') {
-                    tokenList.add(Token(4, lexerBuffer))
+                    tokenList.add(Token(LexState.STRING, lexerBuffer))
                     lexerBuffer = ""
+                    state = LexState.IDLE
                     continue
                 }
                 lexerBuffer += character
             }
+
+            LexState.OPERATOR -> {
+                if (character == '\'' || character == '"') {
+                    tokenList.add(Token(LexState.OPERATOR, lexerBuffer))
+                    lexerBuffer = ""
+                    state = when (character) {
+                        '\'' -> LexState.CHAR
+                        '"' -> LexState.STRING
+                        else -> LexState.IDLE
+                    }
+                    continue
+                }
+                if (character == '/' && lexerBuffer == "/") {
+                    lexerBuffer = ""
+                    state = LexState.ANNOTATION
+                    continue
+                }
+                if (whiteSpace.contains(character) || character.isDigit()) {
+                    tokenList.add(Token(LexState.OPERATOR, lexerBuffer))
+                    lexerBuffer = ""
+                    if (character.isDigit()) {
+                        lexerBuffer += character
+                        state = LexState.INTEGER
+                        continue
+                    }
+                    state = LexState.IDLE
+                    continue
+                }
+                if (enableToLinkWithEqual.contains(lexerBuffer) && character == '=') {
+                    lexerBuffer += '='
+                    tokenList.add(Token(LexState.OPERATOR, lexerBuffer))
+                    lexerBuffer = ""
+                    state = LexState.IDLE
+                    continue
+                }
+                if (enableToDouble.contains(character.toString()) && lexerBuffer.length == 1 && lexerBuffer[0] == character) {
+                    lexerBuffer += character
+                    tokenList.add(Token(LexState.OPERATOR, lexerBuffer))
+                    lexerBuffer = ""
+                    state = LexState.IDLE
+                    continue
+                }
+                tokenList.add(Token(LexState.OPERATOR, lexerBuffer))
+                lexerBuffer = ""
+                when {
+                    character.isDigit() -> {
+                        lexerBuffer += character
+                        state = LexState.INTEGER //switch to Int mode
+                    }
+
+                    character == '.' -> {
+                        lexerBuffer = "."
+                        state = LexState.FLOAT
+                    }
+                    operators.contains(character)->{
+                        lexerBuffer+=character
+                        state=LexState.OPERATOR
+                    }
+                    setOf(' ', '\n', '\t').contains(character) -> state=LexState.IDLE
+                    else -> {
+                        state = LexState.IDENTIFIER
+                        lexerBuffer += character
+                    }//switch to Identify mode
+                }
+            }
+
+            LexState.ANNOTATION -> {
+                if (character == '\n') state = LexState.IDLE
+            }
         }
     }
+    if (state == LexState.ANNOTATION)
+        return tokenList
+    if (state == LexState.CHAR) {
+        throw IllegalStateException("are you missing another \'\"\' ?")
+    }
+    if (state == LexState.STRING) {
+        throw IllegalStateException("are you missing another \"'\" ?")
+    }
+    if (state != LexState.IDLE)
+        tokenList.add(Token(state, lexerBuffer))
+    return tokenList
 }
