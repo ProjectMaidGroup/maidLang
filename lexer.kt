@@ -32,6 +32,8 @@ val whiteSpace = setOf('\\', '"', '\'', ' ', '\n', '\t')
 val escapeCharMap = mapOf('n' to '\n', 't' to '\t', '\'' to '\'')
 
 data class Token(val type: LexState, val value: String) //define same as state
+
+
 enum class LexState(val id: Int) {
     IDLE(0), IDENTIFIER(1), INTEGER(2), FLOAT(3), CHAR(4), STRING(5), OPERATOR(6), ANNOTATION(7)
 }
