@@ -9,8 +9,9 @@ sealed class AstNode {
     data class Variable(val name: String) : AstNode()
     data class FuncCall(val funName: String, val args: ArrayList<AstNode>) : AstNode()
     data class BinaryOp(val op: OpType, val arg1: AstNode, val arg2: AstNode) : AstNode()
-    data class Unary(val op: OpType, val arg: AstNode) : AstNode()
-    data class CodeBlock(val codes: ArrayList<AstNode>) : AstNode()
+    data class Unary(val op: OpType, val arg: AstNode) : AstNode() //前缀表达式
+    data class CodeBlock(val codes: ArrayList<AstNode>) : AstNode() //代码块
+    data class proxyVar(val name: String,val position: AstNode) : AstNode() //Kotlin 代理对象，表示name[position]
 }
 
 enum class VariableType { INT, FLOAT, FUNC, CHAR, KOTLIN_TYPE }
@@ -54,7 +55,7 @@ class parser(val rawToken: MutableList<Token>) {
         return AstNode.IntNode(1)
     }
 
-    fun postFix(): AstNode {
+    fun postfix(): AstNode {
         if (rawToken[nowElement + 1] == Token(
                 LexState.OPERATOR, "("
             ) || rawToken[nowElement + 1] == Token(LexState.OPERATOR, "[")
@@ -64,11 +65,20 @@ class parser(val rawToken: MutableList<Token>) {
                     if (!funcDefine.contains(rawToken[nowElement].value)) {
                         throw IllegalArgumentException("${rawToken[nowElement].value} is not a Function")
                     }
-
+                    val newNode = AstNode.FuncCall(rawToken[nowElement].value, arrayListOf<AstNode>())
+                    for (i in 0..<funcDefine[rawToken[nowElement].value]!!.args.size) {
+                        newNode.args.add(expression())
+                        if(i!=funcDefine.size - 1) {
+                            consume(Token(LexState.OPERATOR, ","))
+                        }
+                    }
+                    consume(Token(LexState.OPERATOR, ")"))
+                    return newNode
                 }
 
                 Token(LexState.OPERATOR, "[") -> {
-
+                    val name = rawToken[nowElement].value
+                    val position =
                 }
             }
         } else {
