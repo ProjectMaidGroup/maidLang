@@ -26,8 +26,6 @@ enum class OpType {
  *
  * 本编译器采用递归下降法构建 AST，节点设计遵循“原子-运算-语句-结构”的层级。
  */
-data class proxyVar(val name: String, val position: AstNode) : AstNode()
-
 sealed class AstNode {
     data class IntNode(val value: Int) : AstNode()
     data class FloatNode(val value: Float) : AstNode()
@@ -36,23 +34,43 @@ sealed class AstNode {
     data class Variable(val name: String) : AstNode()
     data class FuncCall(val funName: String, val args: ArrayList<AstNode>) : AstNode()
     data class BinaryOp(val op: OpType, val arg1: AstNode, val arg2: AstNode) : AstNode()
-    data class Unary(val op: OpType, val arg: AstNode) : AstNode()
-    data class CodeBlock(val codes: ArrayList<AstNode>) : AstNode()
-    data class ProxyVar(val name: String, val position: AstNode) : AstNode()
+    data class Unary(val op: OpType, val arg: AstNode) : AstNode() //前缀表达式
+    data class CodeBlock(val codes: ArrayList<AstNode>) : AstNode() //代码块
+    data class ProxyVar(val name: String, val position: AstNode) : AstNode() //Kotlin 代理对象，表示name[position]
     data class Assign(val left: AstNode, val right: AstNode) : AstNode()
+    data class FuncDefNode(val name: String, val args: List<String>, val body: CodeBlock) : AstNode()
     data class If(val condition: AstNode, val thenBranch: AstNode, val elseBranch: AstNode?) : AstNode()
     data class While(val condition: AstNode, val body: AstNode) : AstNode()
     data class Return(val value: AstNode?) : AstNode()
-    data class FuncDefNode(val name: String, val args: List<String>, val body: CodeBlock) : AstNode()
 }
 
-enum class VariableType { INT, FLOAT, FUNC, CHAR, KOTLIN_TYPE }
-data class FuncDef(val type: VariableType, val args: List<VariableType>)
+sealed class Type {
+    object IntType : Type()
+    object FloatType : Type()
+    object CharType : Type()
+    object StringType : Type()
+    object BoolType : Type()
+    object VoidType : Type()
+    object KotlinType : Type()
+    data class FunctionType(val paramTypes: List<Type>, val returnType: Type) : Type()
+}
 
 class parser(val rawToken: MutableList<Token>) {
-    val nameTable = mutableMapOf<String, VariableType>()
-    val funcDefine = mutableMapOf<String, FuncDef>()
+    val nameTable = mutableMapOf<String, Type>()
+    val funcDefine = mutableMapOf<String, Type.FunctionType>()
     var nowElement: Int = 0
+
+    init {
+        // 预定义布尔常量 true 和 false 为 int 类型，值分别为 1 和 0
+        nameTable["true"] = Type.IntType
+        nameTable["false"] = Type.IntType
+    }
+
+    private val typeKeywords = setOf("int", "float", "char", "string", "bool", "void")
+
+    private fun isTypeKeyword(token: Token?): Boolean {
+        return token != null && token.type == LexState.IDENTIFIER && token.value in typeKeywords
+    }
 
     private fun isAtEnd(): Boolean = nowElement >= rawToken.size
 
@@ -119,10 +137,43 @@ class parser(val rawToken: MutableList<Token>) {
     fun declaration(): AstNode {
         val current = peek() ?: throw IllegalStateException("Unexpected end of input in declaration")
         return when {
+            current.type == LexState.IDENTIFIER && current.value == "import" -> importDeclaration()
+            isTypeKeyword(current) -> typedVariableDeclaration()
             current.type == LexState.IDENTIFIER && current.value == "var" -> variableDeclaration()
             current.type == LexState.IDENTIFIER && current.value == "fun" -> functionDeclaration()
             else -> statement()
         }
+    }
+
+    private fun parseType(): Type {
+        val token = peek() ?: throw IllegalStateException("Expected type keyword")
+        if (!isTypeKeyword(token)) {
+            throw IllegalStateException("Expected type keyword but got ${token.value}")
+        }
+        nowElement++
+        return when (token.value) {
+            "int" -> Type.IntType
+            "float" -> Type.FloatType
+            "char" -> Type.CharType
+            "string" -> Type.StringType
+            "bool" -> Type.BoolType
+            "void" -> Type.VoidType
+            else -> throw IllegalStateException("Unknown type keyword ${token.value}")
+        }
+    }
+
+    private fun typedVariableDeclaration(): AstNode {
+        val type = parseType()
+        val name = consumeIdentifier()
+        val initExpr = if (match(LexState.OPERATOR, "=")) {
+            expression()
+        } else {
+            // 可以没有初始化？暂时要求必须有
+            throw IllegalStateException("Variable declaration requires initializer currently")
+        }
+        consumeOperator(";")
+        nameTable[name] = type
+        return AstNode.Assign(AstNode.Variable(name), initExpr)
     }
 
     private fun variableDeclaration(): AstNode {
@@ -138,11 +189,12 @@ class parser(val rawToken: MutableList<Token>) {
         consumeOperator(";")
 
         val inferredType = when (initExpr) {
-            is AstNode.IntNode -> VariableType.INT
-            is AstNode.FloatNode -> VariableType.FLOAT
-            is AstNode.CharNode -> VariableType.CHAR
-            is AstNode.FuncCall -> VariableType.FUNC
-            else -> VariableType.KOTLIN_TYPE
+            is AstNode.IntNode -> Type.IntType
+            is AstNode.FloatNode -> Type.FloatType
+            is AstNode.CharNode -> Type.CharType
+            is AstNode.StringNode -> Type.StringType
+            is AstNode.FuncCall -> Type.KotlinType // 函数调用暂视为 Kotlin 类型
+            else -> Type.KotlinType // 未知类型
         }
 
         nameTable[name] = inferredType
@@ -151,26 +203,53 @@ class parser(val rawToken: MutableList<Token>) {
 
     private fun functionDeclaration(): AstNode {
         consumeIdentifier("fun")
+        // 解析返回类型（可选）
+        val returnType = if (isTypeKeyword(peek())) {
+            parseType()
+        } else {
+            Type.VoidType
+        }
         val name = consumeIdentifier()
 
         consumeOperator("(")
         val args = mutableListOf<String>()
+        val argTypes = mutableListOf<Type>()
 
         if (!check(LexState.OPERATOR, ")")) {
             do {
+                // 解析参数类型（可选）
+                val argType = if (isTypeKeyword(peek())) {
+                    parseType()
+                } else {
+                    Type.KotlinType
+                }
                 val argName = consumeIdentifier()
                 args.add(argName)
-                nameTable[argName] = VariableType.KOTLIN_TYPE
+                argTypes.add(argType)
+                nameTable[argName] = argType
             } while (match(LexState.OPERATOR, ","))
         }
 
         consumeOperator(")")
 
-        val oldFunc = funcDefine[name]
-        funcDefine[name] = oldFunc ?: FuncDef(VariableType.FUNC, List(args.size) { VariableType.KOTLIN_TYPE })
+        val funcType = Type.FunctionType(argTypes, returnType)
+        funcDefine[name] = funcType
 
         val body = codeBlock()
         return AstNode.FuncDefNode(name, args, body)
+    }
+
+    private fun importDeclaration(): AstNode {
+        consumeIdentifier("import")
+        // 暂时只打印警告，未实现具体导入逻辑
+        println("Warning: import statement is not implemented yet")
+        // 消耗一个字符串字面量（简化）
+        if (peek()?.type == LexState.STRING) {
+            nowElement++
+        }
+        consumeOperator(";")
+        // 返回一个空的代码块节点
+        return AstNode.CodeBlock(arrayListOf())
     }
 
     /** 语句层级：处理 if, while, return 或 代码块 { } */
@@ -368,41 +447,33 @@ class parser(val rawToken: MutableList<Token>) {
 
     fun postfix(): AstNode {
         var node = primary()
-
         while (true) {
-            if (match(LexState.OPERATOR, "(")) {
-                if (node !is AstNode.Variable) {
-                    throw IllegalStateException("Expected a function name before '('")
+            when {
+                match(LexState.OPERATOR, "(") -> {
+                    val args = arrayListOf<AstNode>()
+                    if (!check(LexState.OPERATOR, ")")) {
+                        do {
+                            args.add(expression())
+                        } while (match(LexState.OPERATOR, ","))
+                    }
+                    consumeOperator(")")
+                    node = if (node is AstNode.Variable) {
+                        AstNode.FuncCall(node.name, args)
+                    } else {
+                        throw IllegalStateException("Can only call variables as functions")
+                    }
                 }
-
-                val funcName = node.name
-                val argsNode = arrayListOf<AstNode>()
-
-                if (!check(LexState.OPERATOR, ")")) {
-                    do {
-                        argsNode.add(expression())
-                    } while (match(LexState.OPERATOR, ","))
+                match(LexState.OPERATOR, "[") -> {
+                    val index = expression()
+                    consumeOperator("]")
+                    node = if (node is AstNode.Variable) {
+                        AstNode.ProxyVar(node.name, index)
+                    } else {
+                        throw IllegalStateException("Can only use [] on variables")
+                    }
                 }
-
-                consumeOperator(")")
-                node = AstNode.FuncCall(funcName, argsNode)
-                continue
+                else -> return node
             }
-
-            if (match(LexState.OPERATOR, "[")) {
-                if (node !is AstNode.Variable) {
-                    throw IllegalArgumentException("Only variables can be accessed by index.")
-                }
-
-                val position = expression()
-                consumeOperator("]")
-                node = AstNode.ProxyVar(node.name, position)
-                continue
-            }
-
-            break
         }
-
-        return node
     }
 }

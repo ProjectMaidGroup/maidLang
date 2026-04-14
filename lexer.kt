@@ -32,6 +32,7 @@ val enableToLinkWithEqual = setOf("+", "-", "*", "/", "|", "%", "&", "^", "=")
 val enableToDouble = setOf("+", "-", "&", "|")
 val whiteSpace = setOf('\\', '"', '\'', ' ', '\n', '\t')
 val escapeCharMap = mapOf('n' to '\n', 't' to '\t', '\'' to '\'')
+val typeKeywords = setOf("int", "float", "char", "string", "bool", "void")
 
 data class Token(val type: LexState, val value: String) //define same as state
 
