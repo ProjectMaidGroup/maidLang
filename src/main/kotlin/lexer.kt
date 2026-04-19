@@ -1,5 +1,3 @@
-import org.intellij.lang.annotations.Identifier
-
 val operators = setOf(
     '!',
     '@',
