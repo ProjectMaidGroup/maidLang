@@ -78,6 +78,27 @@ while (i < 10) {
     print(i);
     i = i + 1;
 }
+
+// for 循环（C 风格）
+for (int i = 0; i < 10; i = i + 1) {
+    print(i);
+}
+
+// for 循环 - 使用 var 推导类型
+for (var i = 0; i < 5; i = i + 1) {
+    print(i * i);
+}
+
+// for 循环 - 省略初始化子句
+int j = 0;
+for (; j < 3; j = j + 1) {
+    print(j);
+}
+
+// for 循环 - 无限循环（使用 break 退出）
+for (;;) {
+    // 无限循环
+}
 ```
 
 ### 2.4 表达式
@@ -95,19 +116,73 @@ int c = a & 0xFF;       // 位运算
 ### 3.1 打印函数
 
 ```c
-print("Hello, world!"); // 输出到标准输出
+print("Hello");      // 输出不换行
+println("World");    // 输出并换行
 ```
 
-### 3.2 导入Kotlin函数
+### 3.2 导入Kotlin/Java函数
 
-可以使用 `import` 语句导入Kotlin标准库或其他已定义的Kotlin函数：
+可以使用 `import` 语句导入任意 Kotlin/Java 类的静态方法：
 
 ```c
-import "kotlin.math.sin" as sin;
-import "kotlin.math.cos" as cos;
+// 导入具体方法，指定别名
+import "java.lang.Math.abs" as abs;
+import "java.lang.Math.sin" as sin;
+import "java.lang.Math.sqrt" as sqrt;
 
-float x = sin(3.14);
+int x = abs(-5);       // 输出 5
+float y = sin(1.57);   // 输出 ~1.0
+float z = sqrt(9.0);   // 输出 3.0
+
+// 也支持 Kotlin 标准库
+import "kotlin.math.roundToInt" as round;
+int r = round(3.7);
 ```
+
+导入路径格式为 `"包名.类名.方法名"`，`as` 指定在 MaidLang 中使用的别名。
+
+### 3.3 外部函数声明（免反射）
+
+可以使用 `external fun` 声明一个由 Kotlin 宿主代码注册的外部函数，无需反射即可调用：
+
+```c
+// MaidLang 中声明外部函数签名
+external fun abs(int) -> int;
+external fun sin(float) -> float;
+external fun sqrt(float) -> float;
+
+int x = abs(-5);     // 输出 5
+float y = sin(1.57); // 输出 ~1.0
+```
+
+在 Kotlin 宿主代码中注册实现：
+
+```kotlin
+val interpreter = Interpreter()
+interpreter.registerNative("abs") { args ->
+    MaidValue.IntVal(kotlin.math.abs(args[0].asInt()))
+}
+interpreter.registerNative("sin") { args ->
+    MaidValue.FloatVal(kotlin.math.sin(args[0].asFloat().toDouble()).toFloat())
+}
+```
+
+语法格式：`external fun 函数名(参数类型1, 参数类型2, ...) -> 返回类型;`
+
+省略 `-> 返回类型` 时默认为 `void`。
+
+### 3.4 运算符
+
+支持双字符比较运算符：
+
+支持双字符比较运算符：
+
+| 运算符 | 含义 |
+|--------|------|
+| `<=`   | 小于等于 |
+| `>=`   | 大于等于 |
+| `==`   | 等于 |
+| `!=`   | 不等于 |
 
 ## 4. 示例程序
 

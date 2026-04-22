@@ -41,7 +41,14 @@ sealed class AstNode {
     data class FuncDefNode(val name: String, val args: List<String>, val body: CodeBlock) : AstNode()
     data class If(val condition: AstNode, val thenBranch: AstNode, val elseBranch: AstNode?) : AstNode()
     data class While(val condition: AstNode, val body: AstNode) : AstNode()
+    data class For(val initializer: AstNode?, val condition: AstNode?, val increment: AstNode?, val body: AstNode) : AstNode()
     data class Return(val value: AstNode?) : AstNode()
+    data class ImportNode(val importPath: String, val alias: String) : AstNode()
+    data class ExternalFuncDecl(
+        val name: String,
+        val paramTypes: List<Type>,
+        val returnType: Type
+    ) : AstNode()
 }
 
 sealed class Type {
@@ -138,9 +145,19 @@ class parser(val rawToken: MutableList<Token>) {
         val current = peek() ?: throw IllegalStateException("Unexpected end of input in declaration")
         return when {
             current.type == LexState.IDENTIFIER && current.value == "import" -> importDeclaration()
-            isTypeKeyword(current) -> typedVariableDeclaration()
+            isTypeKeyword(current) -> {
+                // 检查是否是函数声明（类型关键字后接标识符再接 '('）
+                val next1 = rawToken.getOrNull(nowElement + 1)
+                val next2 = rawToken.getOrNull(nowElement + 2)
+                if (next1?.type == LexState.IDENTIFIER && next2?.type == LexState.OPERATOR && next2.value == "(") {
+                    functionDeclarationWithoutFun()
+                } else {
+                    typedVariableDeclaration()
+                }
+            }
             current.type == LexState.IDENTIFIER && current.value == "var" -> variableDeclaration()
             current.type == LexState.IDENTIFIER && current.value == "fun" -> functionDeclaration()
+            current.type == LexState.IDENTIFIER && current.value == "external" -> externalDeclaration()
             else -> statement()
         }
     }
@@ -239,24 +256,97 @@ class parser(val rawToken: MutableList<Token>) {
         return AstNode.FuncDefNode(name, args, body)
     }
 
-    private fun importDeclaration(): AstNode {
-        consumeIdentifier("import")
-        // 暂时只打印警告，未实现具体导入逻辑
-        println("Warning: import statement is not implemented yet")
-        // 消耗一个字符串字面量（简化）
-        if (peek()?.type == LexState.STRING) {
-            nowElement++
+    private fun functionDeclarationWithoutFun(): AstNode {
+        // 已经位于类型关键字处，解析返回类型
+        val returnType = parseType()  // 消耗类型关键字
+        val name = consumeIdentifier()
+
+        consumeOperator("(")
+        val args = mutableListOf<String>()
+        val argTypes = mutableListOf<Type>()
+
+        if (!check(LexState.OPERATOR, ")")) {
+            do {
+                // 解析参数类型（可选）
+                val argType = if (isTypeKeyword(peek())) {
+                    parseType()
+                } else {
+                    Type.KotlinType
+                }
+                val argName = consumeIdentifier()
+                args.add(argName)
+                argTypes.add(argType)
+                nameTable[argName] = argType
+            } while (match(LexState.OPERATOR, ","))
         }
-        consumeOperator(";")
-        // 返回一个空的代码块节点
-        return AstNode.CodeBlock(arrayListOf())
+
+        consumeOperator(")")
+
+        val funcType = Type.FunctionType(argTypes, returnType)
+        funcDefine[name] = funcType
+
+        val body = codeBlock()
+        return AstNode.FuncDefNode(name, args, body)
     }
 
-    /** 语句层级：处理 if, while, return 或 代码块 { } */
+    private fun importDeclaration(): AstNode {
+        consumeIdentifier("import")
+        // 解析导入路径（字符串字面量）
+        val pathToken = peek() ?: throw IllegalStateException("Expected import path string")
+        if (pathToken.type != LexState.STRING) {
+            throw IllegalStateException("Expected import path string, but found '${pathToken.value}'")
+        }
+        val importPath = pathToken.value
+        nowElement++
+
+        // 解析可选的 "as alias" 部分
+        val alias: String = if (check(LexState.IDENTIFIER, "as")) {
+            consumeIdentifier("as")
+            consumeIdentifier()
+        } else {
+            // 如果没有 as，则使用导入路径的最后一段作为别名
+            importPath.split(".").last()
+        }
+
+        consumeOperator(";")
+        return AstNode.ImportNode(importPath, alias)
+    }
+
+    /**
+     * 外部函数声明：external fun name(type1, type2, ...) -> returnType;
+     *
+     * 声明一个由 Kotlin 宿主代码注册的外部函数，无需反射即可调用。
+     * 例：external fun abs(int) -> int;
+     */
+    private fun externalDeclaration(): AstNode {
+        consumeIdentifier("external")
+        consumeIdentifier("fun")
+        val name = consumeIdentifier()
+        consumeOperator("(")
+        val paramTypes = mutableListOf<Type>()
+        if (!check(LexState.OPERATOR, ")")) {
+            do {
+                val paramType = parseType()
+                paramTypes.add(paramType)
+            } while (match(LexState.OPERATOR, ","))
+        }
+        consumeOperator(")")
+        // 解析可选的返回类型
+        val returnType: Type = if (match(LexState.OPERATOR, "-") && match(LexState.OPERATOR, ">")) {
+            parseType()
+        } else {
+            Type.VoidType
+        }
+        consumeOperator(";")
+        return AstNode.ExternalFuncDecl(name, paramTypes, returnType)
+    }
+
+    /** 语句层级：处理 if, while, for, return 或 代码块 { } */
     fun statement(): AstNode = when {
         check(LexState.OPERATOR, "{") -> codeBlock()
         check(LexState.IDENTIFIER, "if") -> ifStatement()
         check(LexState.IDENTIFIER, "while") -> whileStatement()
+        check(LexState.IDENTIFIER, "for") -> forStatement()
         check(LexState.IDENTIFIER, "return") -> returnStatement()
         else -> expressionStatement()
     }
@@ -283,6 +373,79 @@ class parser(val rawToken: MutableList<Token>) {
         consumeOperator(")")
         val body = statement()
         return AstNode.While(condition, body)
+    }
+
+    /**
+     * For 语句 - for (init; cond; inc) stmt
+     *
+     * 支持 C 风格 for 循环：
+     *   for (int i = 0; i < 10; i = i + 1) { ... }
+     *   for (var i = 0; i < 10; i = i + 1) { ... }
+     *   for (i = 0; i < 10; ++i) { ... }
+     *   for (;;) { ... }  // 无限循环
+     */
+    fun forStatement(): AstNode {
+        consumeIdentifier("for")
+        consumeOperator("(")
+
+        // 解析初始化子句：可以是变量声明、表达式或空
+        val initializer: AstNode? = when {
+            isTypeKeyword(peek()) -> {
+                // 类型化变量声明：int i = 0
+                val type = parseType()
+                val name = consumeIdentifier()
+                val initExpr = if (match(LexState.OPERATOR, "=")) {
+                    expression()
+                } else {
+                    null
+                }
+                nameTable[name] = type
+                AstNode.Assign(AstNode.Variable(name), initExpr ?: AstNode.IntNode(0))
+            }
+            check(LexState.IDENTIFIER, "var") -> {
+                // var 变量声明：var i = 0
+                consumeIdentifier("var")
+                val name = consumeIdentifier()
+                val initExpr = if (match(LexState.OPERATOR, "=")) {
+                    expression()
+                } else {
+                    throw IllegalStateException("for loop var declaration requires initializer")
+                }
+                val inferredType = when (initExpr) {
+                    is AstNode.IntNode -> Type.IntType
+                    is AstNode.FloatNode -> Type.FloatType
+                    is AstNode.CharNode -> Type.CharType
+                    is AstNode.StringNode -> Type.StringType
+                    else -> Type.KotlinType
+                }
+                nameTable[name] = inferredType
+                AstNode.Assign(AstNode.Variable(name), initExpr)
+            }
+            !check(LexState.OPERATOR, ";") -> {
+                // 表达式
+                expression()
+            }
+            else -> null // 空初始化子句
+        }
+
+        consumeOperator(";")
+
+        // 解析条件子句（可选）
+        val condition: AstNode? = if (!check(LexState.OPERATOR, ";")) {
+            expression()
+        } else null
+
+        consumeOperator(";")
+
+        // 解析增量子句（可选）
+        val increment: AstNode? = if (!check(LexState.OPERATOR, ")")) {
+            expression()
+        } else null
+
+        consumeOperator(")")
+
+        val body = statement()
+        return AstNode.For(initializer, condition, increment, body)
     }
 
     fun returnStatement(): AstNode {

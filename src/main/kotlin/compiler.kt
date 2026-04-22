@@ -157,6 +157,34 @@ class Compiler {
                 val afterLoop = context.chunk.code.size
                 context.chunk.code[jumpIfFalsePos + 1] = afterLoop
             }
+            is AstNode.For -> {
+                // for (init; cond; inc) body
+                // 编译初始化子句
+                node.initializer?.let { compileNode(it) }
+                // 如果初始化子句产生了一个值，弹出丢弃（它不在栈上保留）
+                // 注意：compileNode 可能将结果留在栈上，需要 POP 处理
+                // 但目前的 CodeBlock 实现未处理 POP，暂不处理
+
+                val loopStart = context.chunk.code.size
+                // 编译条件（条件为 null 时视为 true，但编译模式下需生成 LOAD_TRUE）
+                if (node.condition != null) {
+                    compileNode(node.condition)
+                } else {
+                    context.chunk.emit(Opcode.LOAD_TRUE)
+                }
+                // 条件为假时跳出循环
+                val jumpIfFalsePos = context.chunk.code.size
+                context.chunk.emit(Opcode.JUMP_IF_FALSE, 0) // 占位
+                // 编译循环体
+                compileNode(node.body)
+                // 编译增量子句
+                node.increment?.let { compileNode(it) }
+                // 循环体结束后跳回条件检查
+                context.chunk.emit(Opcode.JUMP, loopStart)
+                // 修正跳出偏移量
+                val afterLoop = context.chunk.code.size
+                context.chunk.code[jumpIfFalsePos + 1] = afterLoop
+            }
             is AstNode.FuncDefNode -> {
                 // 函数定义：暂时不编译函数体，仅记录函数名（后续实现）
                 println("Warning: function definition compilation not implemented yet")
@@ -178,6 +206,16 @@ class Compiler {
                     context.chunk.emit(Opcode.LOAD_NULL)
                 }
                 context.chunk.emit(Opcode.RETURN)
+            }
+            is AstNode.ImportNode -> {
+                // 导入声明：在编译模式下暂时只输出警告
+                println("Warning: import statement is not supported in compiled mode yet")
+                context.chunk.emit(Opcode.LOAD_NULL)
+            }
+            is AstNode.ExternalFuncDecl -> {
+                // 外部函数声明：编译模式下暂不支持
+                println("Warning: external function declaration is not supported in compiled mode yet")
+                context.chunk.emit(Opcode.LOAD_NULL)
             }
             is AstNode.ProxyVar -> {
                 // 数组/代理访问：暂不实现

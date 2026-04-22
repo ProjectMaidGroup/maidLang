@@ -1,4 +1,6 @@
 import kotlin.math.*
+import java.lang.reflect.Method
+import java.lang.reflect.Modifier
 
 sealed class MaidValue {
     data class IntVal(var value: Int) : MaidValue()
@@ -6,6 +8,16 @@ sealed class MaidValue {
     data class StringVal(var value: String) : MaidValue()
     data class CharVal(var value: Char) : MaidValue()
     data class FunctionVal(val node: AstNode.FuncDefNode, val closure: Scope) : MaidValue()
+    data class KotlinFuncVal(
+        val funcName: String,
+        val className: String,
+        val methodName: String
+    ) : MaidValue()
+    /** 原生函数值：由 Kotlin 宿主代码注册的外部函数，无需反射即可调用 */
+    data class NativeFuncVal(
+        val name: String,
+        val func: (List<MaidValue>) -> MaidValue
+    ) : MaidValue()
     object NullVal : MaidValue()
 
     fun asInt(): Int = when (this) {
@@ -32,6 +44,8 @@ sealed class MaidValue {
         is StringVal -> value
         is CharVal -> value.toString()
         is FunctionVal -> "<function ${node.name}>"
+        is KotlinFuncVal -> "<kotlin function $funcName>"
+        is NativeFuncVal -> "<native function $name>"
         NullVal -> "null"
     }
 }
@@ -49,7 +63,8 @@ class Scope(val parent: Scope? = null) {
         } else if (parent != null) {
             parent.assign(name, value)
         } else {
-            throw RuntimeException("Undefined variable: $name")
+            // 变量未定义，自动定义它（隐式声明）
+            variables[name] = value
         }
     }
 
@@ -62,13 +77,26 @@ class ReturnException(val value: MaidValue) : RuntimeException()
 
 class Interpreter {
     val globalScope = Scope()
+    /** 原生函数注册表：名称 -> (参数列表) -> MaidValue */
+    private val nativeFunctions = mutableMapOf<String, (List<MaidValue>) -> MaidValue>()
+
+    /**
+     * 注册一个原生函数，供 MaidLang 中的 external fun 声明使用。
+     * 注册后，MaidLang 代码可通过 external fun 声明后直接调用，无需反射。
+     */
+    fun registerNative(name: String, func: (List<MaidValue>) -> MaidValue) {
+        nativeFunctions[name] = func
+    }
 
     init {
         // 预定义布尔常量 true 和 false
         globalScope.define("true", MaidValue.IntVal(1))
         globalScope.define("false", MaidValue.IntVal(0))
         // 可选：预定义一些数学常量
-        globalScope.define("PI", MaidValue.FloatVal(3.141592653589793))
+        globalScope.define("PI", MaidValue.FloatVal(3.1415927f))
+        // 内置函数 print 和 println
+        globalScope.define("print", MaidValue.IntVal(0))
+        globalScope.define("println", MaidValue.IntVal(0))
     }
 
     fun interpret(node: AstNode): MaidValue {
@@ -142,6 +170,22 @@ class Interpreter {
                 lastValue
             }
 
+            is AstNode.For -> {
+                // for (init; cond; inc) body
+                // 使用新的作用域，使 init 中声明的变量不会泄漏到外部
+                val forScope = Scope(scope)
+                // 执行初始化子句
+                node.initializer?.let { eval(it, forScope) }
+                var lastValue: MaidValue = MaidValue.NullVal
+                // 循环：条件为 null 时视为 true（无限循环）
+                while (node.condition == null || eval(node.condition, forScope).asBool()) {
+                    lastValue = eval(node.body, forScope)
+                    // 执行增量子句
+                    node.increment?.let { eval(it, forScope) }
+                }
+                lastValue
+            }
+
             is AstNode.Return -> {
                 val value = node.value?.let { eval(it, scope) } ?: MaidValue.NullVal
                 throw ReturnException(value)
@@ -172,12 +216,36 @@ class Interpreter {
                     } catch (e: ReturnException) {
                         e.value
                     }
+                } else if (funcValue is MaidValue.KotlinFuncVal) {
+                    // 调用 Kotlin 函数（通过反射）
+                    callKotlinFunction(funcValue, node.args, scope)
+                } else if (funcValue is MaidValue.NativeFuncVal) {
+                    // 调用原生函数（免反射，直接调用 Kotlin lambda）
+                    val args = node.args.map { eval(it, scope) }
+                    funcValue.func(args)
                 } else {
                     // Built-in functions or errors
                     when (node.funName) {
-                        "print" -> {
+                        "print", "println" -> {
                             val args = node.args.map { eval(it, scope) }
-                            println(args.joinToString(" "))
+                            // 自定义格式化，避免输出类型信息
+                            val formatted = args.joinToString(" ") { value ->
+                                when (value) {
+                                    is MaidValue.IntVal -> value.value.toString()
+                                    is MaidValue.FloatVal -> value.value.toString()
+                                    is MaidValue.StringVal -> value.value
+                                    is MaidValue.CharVal -> value.value.toString()
+                                    is MaidValue.FunctionVal -> "<function ${value.node.name}>"
+                                    is MaidValue.KotlinFuncVal -> "<kotlin function ${value.funcName}>"
+                                    is MaidValue.NativeFuncVal -> "<native function ${value.name}>"
+                                    MaidValue.NullVal -> "null"
+                                }
+                            }
+                            if (node.funName == "println") {
+                                println(formatted)
+                            } else {
+                                print(formatted)
+                            }
                             MaidValue.NullVal
                         }
                         else -> throw RuntimeException("${node.funName} is not a function")
@@ -185,6 +253,38 @@ class Interpreter {
                 }
             }
             
+            is AstNode.ImportNode -> {
+                // 解析导入路径：格式为 "fully.qualified.ClassName.methodName"
+                val path = node.importPath
+                val alias = node.alias
+                
+                // 从路径中提取类名和方法名
+                val lastDot = path.lastIndexOf('.')
+                if (lastDot == -1) {
+                    throw RuntimeException("Invalid import path '$path'. Expected format: 'package.ClassName.methodName'")
+                }
+                val className = path.substring(0, lastDot)
+                val methodName = path.substring(lastDot + 1)
+                
+                // 注册为 KotlinFuncVal
+                val kotlinFunc = MaidValue.KotlinFuncVal(alias, className, methodName)
+                scope.define(alias, kotlinFunc)
+                println("Imported Kotlin function: $alias -> $className.$methodName")
+                MaidValue.NullVal
+            }
+
+            is AstNode.ExternalFuncDecl -> {
+                // 在原生函数注册表中查找并绑定
+                val nativeFunc = nativeFunctions[node.name]
+                if (nativeFunc == null) {
+                    throw RuntimeException("External function '${node.name}' is not registered. " +
+                            "Use interpreter.registerNative(\"${node.name}\") { ... } in Kotlin host code.")
+                }
+                val funcVal = MaidValue.NativeFuncVal(node.name, nativeFunc)
+                scope.define(node.name, funcVal)
+                MaidValue.NullVal
+            }
+
             is AstNode.ProxyVar -> {
                 // For now, let's treat it as a mock or simple array access if we had arrays
                 // The user mentioned it's a "Kotlin 代理对象"
@@ -262,6 +362,123 @@ class Interpreter {
                 } else throw RuntimeException("-- requires a variable")
             }
             else -> throw RuntimeException("Unsupported unary operator: $op")
+        }
+    }
+
+    /**
+     * 通过反射调用 Kotlin/Java 静态方法。
+     * importPath 格式: "fully.qualified.ClassName.methodName"
+     */
+    private fun callKotlinFunction(func: MaidValue.KotlinFuncVal, args: ArrayList<AstNode>, scope: Scope): MaidValue {
+        // 计算参数值
+        val argValues = args.map { eval(it, scope) }
+
+        // 加载类
+        val clazz: Class<*>
+        try {
+            clazz = Class.forName(func.className)
+        } catch (e: ClassNotFoundException) {
+            throw RuntimeException("Class not found: ${func.className}")
+        }
+
+        // 查找匹配的静态方法
+        val methods = clazz.methods.filter { m ->
+            m.name == func.methodName &&
+            Modifier.isStatic(m.modifiers) &&
+            m.parameterCount == argValues.size
+        }
+
+        if (methods.isEmpty()) {
+            throw RuntimeException("Static method '${func.methodName}' with ${argValues.size} params not found on ${func.className}")
+        }
+
+        // 尝试每个匹配的方法，找到参数类型兼容的
+        for (method in methods) {
+            try {
+                val jvmArgs = convertArgsToJvm(method, argValues)
+                val result = method.invoke(null, *jvmArgs)
+                return convertJvmToMaidValue(result)
+            } catch (e: IllegalArgumentException) {
+                // 参数类型不匹配，尝试下一个重载
+                continue
+            }
+        }
+
+        throw RuntimeException("Could not invoke ${func.className}.${func.methodName} with the given arguments")
+    }
+
+    /**
+     * 将 MaidValue 参数列表转换为 JVM 方法调用所需的 Object[]。
+     */
+    private fun convertArgsToJvm(method: Method, args: List<MaidValue>): Array<Any?> {
+        val paramTypes = method.parameterTypes
+        return Array(paramTypes.size) { i ->
+            val maidVal = args[i]
+            val targetType = paramTypes[i]
+            convertOneArg(maidVal, targetType)
+        }
+    }
+
+    /**
+     * 将单个 MaidValue 转换为目标 JVM 类型。
+     */
+    private fun convertOneArg(value: MaidValue, targetType: Class<*>): Any? {
+        return when (value) {
+            is MaidValue.IntVal -> {
+                when (targetType) {
+                    Int::class.javaPrimitiveType, Int::class.java -> value.value
+                    Long::class.javaPrimitiveType, Long::class.java -> value.value.toLong()
+                    Float::class.javaPrimitiveType, Float::class.java -> value.value.toFloat()
+                    Double::class.javaPrimitiveType, Double::class.java -> value.value.toDouble()
+                    Short::class.javaPrimitiveType, Short::class.java -> value.value.toShort()
+                    Byte::class.javaPrimitiveType, Byte::class.java -> value.value.toByte()
+                    String::class.java -> value.value.toString()
+                    else -> value.value
+                }
+            }
+            is MaidValue.FloatVal -> {
+                when (targetType) {
+                    Float::class.javaPrimitiveType, Float::class.java -> value.value
+                    Double::class.javaPrimitiveType, Double::class.java -> value.value.toDouble()
+                    Int::class.javaPrimitiveType, Int::class.java -> value.value.toInt()
+                    Long::class.javaPrimitiveType, Long::class.java -> value.value.toLong()
+                    String::class.java -> value.value.toString()
+                    else -> value.value
+                }
+            }
+            is MaidValue.StringVal -> {
+                if (targetType == String::class.java) value.value
+                else value.value
+            }
+            is MaidValue.CharVal -> {
+                when (targetType) {
+                    Char::class.javaPrimitiveType, Char::class.java -> value.value
+                    Int::class.javaPrimitiveType, Int::class.java -> value.value.code
+                    String::class.java -> value.value.toString()
+                    else -> value.value
+                }
+            }
+            MaidValue.NullVal -> null
+            else -> value.toString()
+        }
+    }
+
+    /**
+     * 将 JVM 反射调用结果转换为 MaidValue。
+     */
+    private fun convertJvmToMaidValue(result: Any?): MaidValue {
+        if (result == null) return MaidValue.NullVal
+        return when (result) {
+            is Int -> MaidValue.IntVal(result)
+            is Long -> MaidValue.IntVal(result.toInt())
+            is Short -> MaidValue.IntVal(result.toInt())
+            is Byte -> MaidValue.IntVal(result.toInt())
+            is Float -> MaidValue.FloatVal(result)
+            is Double -> MaidValue.FloatVal(result.toFloat())
+            is Boolean -> MaidValue.IntVal(if (result) 1 else 0)
+            is Char -> MaidValue.CharVal(result)
+            is String -> MaidValue.StringVal(result)
+            else -> MaidValue.StringVal(result.toString())
         }
     }
 }
